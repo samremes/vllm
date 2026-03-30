@@ -495,31 +495,6 @@ def _rocm_aiter_gemm_a8w8_fake(
     return Y
 
 
-def _rocm_aiter_triton_gemm_a8w8_blockscale_impl(
-    A: torch.Tensor,
-    B: torch.Tensor,
-    As: torch.Tensor,
-    Bs: torch.Tensor,
-    output_dtype: torch.dtype = torch.float16,
-) -> torch.Tensor:
-    from aiter.ops.triton.gemm_a8w8_blockscale import gemm_a8w8_blockscale
-
-    return gemm_a8w8_blockscale(A, B, As, Bs, dtype=output_dtype)
-
-
-def _rocm_aiter_triton_gemm_a8w8_blockscale_fake(
-    A: torch.Tensor,
-    B: torch.Tensor,
-    As: torch.Tensor,
-    Bs: torch.Tensor,
-    output_dtype: torch.dtype = torch.float16,
-) -> torch.Tensor:
-    m = A.shape[0]
-    n = B.shape[0]
-    Y = torch.empty(m, n, dtype=output_dtype, device=A.device)
-    return Y
-
-
 def _rocm_aiter_gemm_a8w8_blockscale_impl(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -1049,7 +1024,7 @@ class rocm_aiter_ops:
         - Routing: topk_softmax, biased_grouped_topk, grouped_topk
         - MLA decode: mla_decode_fwd
         - Quantization: per_tensor_quant, per_token_quant, group_fp8_quant
-        - Triton ops: triton_rotary_embed, triton_fp8_bmm, triton_gemm_a8w8_blockscale
+        - Triton ops: triton_rotary_embed, triton_fp8_bmm
     """
 
     # Check if the env variable is set
@@ -1317,12 +1292,6 @@ class rocm_aiter_ops:
             )
 
             direct_register_custom_op(
-                op_name="rocm_aiter_triton_gemm_a8w8_blockscale",
-                op_func=_rocm_aiter_triton_gemm_a8w8_blockscale_impl,
-                fake_impl=_rocm_aiter_triton_gemm_a8w8_blockscale_fake,
-            )
-
-            direct_register_custom_op(
                 op_name="rocm_aiter_gemm_a8w8_blockscale",
                 op_func=_rocm_aiter_gemm_a8w8_blockscale_impl,
                 fake_impl=_rocm_aiter_gemm_a8w8_blockscale_fake,
@@ -1498,19 +1467,6 @@ class rocm_aiter_ops:
         output_dtype: torch.dtype = torch.float16,
     ) -> torch.Tensor:
         return torch.ops.vllm.rocm_aiter_gemm_a8w8(A, B, As, Bs, bias, output_dtype)
-
-    @staticmethod
-    def triton_gemm_a8w8_blockscale(
-        A: torch.Tensor,
-        B: torch.Tensor,
-        As: torch.Tensor,
-        Bs: torch.Tensor,
-        block_size: list[int],
-        output_dtype: torch.dtype = torch.float16,
-    ) -> torch.Tensor:
-        return torch.ops.vllm.rocm_aiter_triton_gemm_a8w8_blockscale(
-            A, B, As, Bs, output_dtype
-        )
 
     @staticmethod
     def gemm_a8w8_blockscale(
@@ -1874,22 +1830,6 @@ class rocm_aiter_ops:
     ) -> tuple[torch.Tensor, torch.Tensor]:
         assert group_size == 128, "Group size must be 128"
         return torch.ops.vllm.rocm_aiter_group_fp8_quant(input_2d, group_size)
-
-    @staticmethod
-    def is_triton_gemm_w8a8_tuned(n: int, k: int) -> bool:
-        return (n, k) in [
-            (1024, 8192),
-            (2112, 7168),
-            (3072, 1536),
-            (32768, 8192),
-            (4096, 7168),
-            (4608, 7168),
-            (512, 7168),
-            (7168, 2048),
-            (7168, 256),
-            (8192, 1024),
-            (8192, 32768),
-        ]
 
     @staticmethod
     def is_triton_gemm_afp4wfp4_presh_ws_tuned(n: int, k: int) -> bool:

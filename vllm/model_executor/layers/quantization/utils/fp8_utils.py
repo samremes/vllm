@@ -482,24 +482,12 @@ class W8A8BlockFp8LinearOp:
     ) -> torch.Tensor:
         assert self.act_quant_group_shape == GroupShape(1, 128)
 
-        n, k = weight.shape
-
-        use_triton = (
-            not current_platform.is_fp8_fnuz()
-            and rocm_aiter_ops.is_triton_gemm_w8a8_tuned(n, k)
-        )
-
-        if use_triton:
-            gemm_a8w8_blockscale_op = rocm_aiter_ops.triton_gemm_a8w8_blockscale
-        else:
-            gemm_a8w8_blockscale_op = rocm_aiter_ops.gemm_a8w8_blockscale
-
         if input_scale is not None:
             q_input = input_2d
         else:
-            q_input, input_scale = self.input_quant_op(input_2d, use_triton=use_triton)
+            q_input, input_scale = self.input_quant_op(input_2d)
 
-        return gemm_a8w8_blockscale_op(
+        return rocm_aiter_ops.gemm_a8w8_blockscale(
             q_input,
             weight,
             input_scale,
