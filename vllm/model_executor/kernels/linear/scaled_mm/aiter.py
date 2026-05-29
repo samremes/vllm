@@ -275,12 +275,6 @@ class AiterPerTokenFp8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
 class AiterFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
     def __init__(self, config: FP8ScaledMMLinearLayerConfig):
         super().__init__(config)
-        n, k = config.weight_shape
-
-        self.use_triton = (
-            not current_platform.is_fp8_fnuz()
-            and rocm_aiter_ops.is_triton_gemm_w8a8_tuned(n, k)
-        )
 
     @classmethod
     def is_supported(cls, compute_capability=None):
@@ -328,11 +322,7 @@ class AiterFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
                 Bs = Bs.to(torch.float32)
 
         out_dtype = self.config.out_dtype
-        if self.use_triton:
-            gemm_a8w8_blockscale_op = rocm_aiter_ops.triton_gemm_a8w8_blockscale
-        else:
-            gemm_a8w8_blockscale_op = rocm_aiter_ops.gemm_a8w8_blockscale
-
-        return gemm_a8w8_blockscale_op(
+        return rocm_aiter_ops.gemm_a8w8_blockscale(
             A, B, As, Bs, list(self.weight_group_shape), output_dtype=out_dtype
         )
+
