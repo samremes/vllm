@@ -134,10 +134,6 @@ class PassConfig:
     """Enable async TP."""
     fuse_allreduce_rms: bool = None  # type: ignore[assignment]
     """Enable flashinfer allreduce fusion."""
-    fuse_minimax_qk_norm: bool = None  # type: ignore[assignment]
-    """Deprecated. The MiniMax QK norm fusion is now applied automatically at
-    runtime (see `MiniMaxText01RMSNormTP.forward_qkv`). This flag is kept for
-    backward compatibility and has no effect; it will be removed in v0.23."""
     enable_qk_norm_rope_fusion: bool = None  # type: ignore[assignment]
     """Enable fused Q/K RMSNorm + RoPE pass."""
     fuse_rope_kvcache_cat_mla: bool = None  # type: ignore[assignment]
@@ -150,6 +146,18 @@ class PassConfig:
     """Fuse paired q/kv RMS norms in MLA attention."""
     fuse_rope_kvcache: bool = None  # type: ignore[assignment]
     """Fuse the QK rope + KV cache ops."""
+    fuse_blockscale_splitk_zero_init: bool = None  # type: ignore[assignment]
+    """Fuse the zero-init of the blockscale FP8 GEMM output buffer into the
+    upstream producer (RMSNorm/quant) and enable SplitK on the GEMM. Eliminates
+    the standalone Y.zero_() fill kernel that otherwise precedes a SplitK
+    blockscale GEMM. ROCm/AITER only -- the dispatching producer and GEMM
+    custom ops live in vllm/_aiter_ops.py."""
+    blockscale_splitk_zero_init_min_k: int = Field(
+        default_factory=lambda: envs.VLLM_ROCM_AITER_BLOCKSCALE_SPLITK_ZERO_INIT_MIN_K,
+        ge=0,
+    )
+    """Minimum GEMM K dimension required for blockscale SplitK zero-init
+    fusion. Set to 0 to allow all statically known K values."""
 
     rope_kvcache_fusion_max_token_num: int = 256
     """The threshold for ROCm AITER RoPE+KVCache fusion e.g. for small batch decode.
@@ -233,6 +241,7 @@ class PassConfig:
         "fuse_mla_dual_rms_norm",
         "fuse_rope_kvcache",
         "fuse_rope_kvcache_cat_mla",
+        "fuse_blockscale_splitk_zero_init",
         mode="wrap",
     )
     @classmethod
@@ -296,13 +305,12 @@ class PassConfig:
                 "current platform is not CUDA or ROCm. The fusion will be disabled."
             )
             self.fuse_rope_kvcache_cat_mla = False
-        if self.fuse_minimax_qk_norm is not None:
+        if self.fuse_blockscale_splitk_zero_init and not current_platform.is_rocm():
             logger.warning_once(
-                "`fuse_minimax_qk_norm` is deprecated and has no effect; "
-                "the MiniMax QK norm fusion is now applied automatically at "
-                "runtime when its conditions are met. This flag will be "
-                "removed in v0.23."
+                "Blockscale SplitK zero-init fusion currently only enabled on "
+                "ROCm/AITER. The fusion will be disabled."
             )
+            self.fuse_blockscale_splitk_zero_init = False
 
     def log_enabled_passes(self) -> None:
         """
@@ -1208,7 +1216,7 @@ class CompilationConfig:
                 "are optimized for prefill and are incompatible with CUDA Graphs. "
                 "In order to use CUDA Graphs for decode-optimized workloads, "
                 "use --all2all-backend with another option, such as "
-                "deepep_low_latency or allgather_reducescatter."
+                "deepep_low_latency, nixl_ep, or allgather_reducescatter."
             )
             self.cudagraph_mode = CUDAGraphMode.NONE
 

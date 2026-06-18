@@ -22,12 +22,18 @@ if rocm_aiter_ops.is_enabled():
     from .fusion.allreduce_rms_fusion import (
         RocmAiterAllReduceFusionPass,
     )
+    from .fusion.blockscale_splitk_zero_init import (
+        BlockScaleSplitKZeroInitFusionPass,
+    )
     from .fusion.rocm_aiter_fusion import (
         MLADualRMSNormFusionPass,
         RocmAiterRMSNormQuantFusionPass,
         RocmAiterSiluMulFp8GroupQuantFusionPass,
         RocmAiterTritonAddRMSNormPadFusionPass,
     )
+
+if current_platform.is_cuda_alike() or current_platform.is_xpu():
+    from .fusion.sequence_parallelism import SequenceParallelismPass
 
 if current_platform.is_cuda_alike():
     from .fusion.act_quant_fusion import ActivationQuantFusionPass
@@ -37,7 +43,6 @@ if current_platform.is_cuda_alike():
     from .fusion.qk_norm_rope_fusion import QKNormRoPEFusionPass
     from .fusion.rms_quant_fusion import RMSNormQuantFusionPass
     from .fusion.rope_kvcache_fusion import RopeKVCacheFusionPass
-    from .fusion.sequence_parallelism import SequenceParallelismPass
     from .utility.scatter_split_replace import ScatterSplitReplacementPass
     from .utility.split_coalescing import SplitCoalescingPass
 
@@ -168,6 +173,17 @@ class PostGradPassManager(CustomGraphPass):  # type: ignore[misc]
                 self.passes += [ActivationQuantFusionPass(config)]
                 if rocm_aiter_ops.is_enabled():
                     self.passes += [RocmAiterSiluMulFp8GroupQuantFusionPass(config)]
+
+            # Blockscale SplitK + zero-init fusion runs AFTER the producer
+            # fusions above, so its pattern matches against the already-fused
+            # producer ops (e.g. rocm_aiter_rmsnorm_fp8_group_quant,
+            # rocm_aiter_act_mul_and_fp8_group_quant, etc.) rather than
+            # the raw RMSNorm + quant chain.
+            if (
+                self.pass_config.fuse_blockscale_splitk_zero_init
+                and rocm_aiter_ops.is_enabled()
+            ):
+                self.passes += [BlockScaleSplitKZeroInitFusionPass(config)]
 
             if (
                 self.pass_config.fuse_mla_dual_rms_norm
