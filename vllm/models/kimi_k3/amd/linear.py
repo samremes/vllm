@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from collections.abc import Iterable
 from typing import Any, cast
 
@@ -423,11 +424,21 @@ class KimiMoE(nn.Module):
                 if self.latent_moe_use_norm
                 else None
             )
+            from vllm.platforms.rocm import on_gfx950
+
+            use_replicated_up_proj_sp = (
+                on_gfx950()
+                and envs.VLLM_ROCM_USE_AITER
+                and envs.VLLM_ROCM_USE_AITER_MOE
+                and envs.VLLM_ROCM_USE_AITER_FMOE_TP_SDMA
+                and os.getenv("VLLM_ROCM_KIMI_UP_PROJ_SP", "1").lower() in ("1", "true")
+            )
             shard_up_proj = (
                 self.tp_size > 1
                 and hidden_size % self.tp_size == 0
                 and self.num_shared_experts is not None
                 and self.routed_scaling_factor == 1.0
+                and not use_replicated_up_proj_sp
             )
             if shard_up_proj:
                 # gather_output is a fallback restoring the full hidden dim for

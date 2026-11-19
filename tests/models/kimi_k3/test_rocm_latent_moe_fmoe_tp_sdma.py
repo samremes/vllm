@@ -30,7 +30,7 @@ def _has_fmoe_tp_sdma_tp2() -> bool:
         return all(
             (2, 3584, 384, 16, 64, a_dt, "situ", epi, 0) in reg
             for a_dt in ("fp4", "fp8")
-            for epi in ("rmsnorm_only", "raw_bf16")
+            for epi in ("rmsnorm_only", "raw_bf16", "raw_bf16_sp")
         )
     except Exception:
         return False
@@ -152,10 +152,16 @@ def _bf16_ref_forward(
         latent = moe.routed_expert_norm(latent)
 
     up_w = moe.routed_expert_up_proj.weight
-    shard_size = up_w.shape[0]
-    shard_start = tp_rank * shard_size
+    if moe.routed_output_transform.row_sharded:
+        shard_size = up_w.shape[0]
+        shard_start = tp_rank * shard_size
+        up_w_shard = up_w
+    else:
+        shard_size = up_w.shape[0] // dist.get_world_size()
+        shard_start = tp_rank * shard_size
+        up_w_shard = up_w.narrow(0, shard_start, shard_size)
     out = shared_out.clone()
-    out[:, shard_start : shard_start + shard_size].addmm_(latent, up_w.t())
+    out[:, shard_start : shard_start + shard_size].addmm_(latent, up_w_shard.t())
     out_f32 = out.float()
     dist.all_reduce(out_f32)
     return out_f32.to(torch.bfloat16)
@@ -164,16 +170,14 @@ def _bf16_ref_forward(
 def _init_weights(module: torch.nn.Module, seed: int, tp_rank: int) -> None:
     g_rep = torch.Generator(device="cuda").manual_seed(seed)
     g_tp = torch.Generator(device="cuda").manual_seed(seed + 1000 + tp_rank)
+    up_is_tp = bool(
+        getattr(getattr(module, "routed_output_transform", None), "row_sharded", False)
+    )
+    tp_keys = ["shared_experts", "w13_weight", "w2_weight"]
+    if up_is_tp:
+        tp_keys.append("routed_expert_up_proj")
     for name, p in module.named_parameters():
-        is_tp = any(
-            k in name
-            for k in (
-                "shared_experts",
-                "routed_expert_up_proj",
-                "w13_weight",
-                "w2_weight",
-            )
-        )
+        is_tp = any(k in name for k in tp_keys)
         g = g_tp if is_tp else g_rep
         if p.dtype in (torch.bfloat16, torch.float32):
             if "norm" in name:
@@ -258,7 +262,8 @@ def _run_suite(
     device: torch.device,
     rms_norm_eps: float,
     expected_epi_mode: str,
-) -> None:
+    up_proj_sp: bool,
+) -> dict[tuple[str, int], float]:
     import vllm.envs as envs
     from vllm.config import set_current_vllm_config
     from vllm.distributed import get_tp_group
@@ -266,6 +271,42 @@ def _run_suite(
     from vllm.model_executor.model_loader.utils import process_weights_after_loading
     from vllm.models.kimi_k3.amd.linear import KimiMoE
 
+    prev_sp_env = os.environ.get("VLLM_ROCM_KIMI_UP_PROJ_SP")
+    os.environ["VLLM_ROCM_KIMI_UP_PROJ_SP"] = "1" if up_proj_sp else "0"
+    try:
+        return _run_suite_inner(
+            rank,
+            device,
+            rms_norm_eps,
+            expected_epi_mode,
+            up_proj_sp,
+            envs,
+            set_current_vllm_config,
+            get_tp_group,
+            set_forward_context,
+            process_weights_after_loading,
+            KimiMoE,
+        )
+    finally:
+        if prev_sp_env is None:
+            os.environ.pop("VLLM_ROCM_KIMI_UP_PROJ_SP", None)
+        else:
+            os.environ["VLLM_ROCM_KIMI_UP_PROJ_SP"] = prev_sp_env
+
+
+def _run_suite_inner(
+    rank: int,
+    device: torch.device,
+    rms_norm_eps: float,
+    expected_epi_mode: str,
+    up_proj_sp: bool,
+    envs,
+    set_current_vllm_config,
+    get_tp_group,
+    set_forward_context,
+    process_weights_after_loading,
+    KimiMoE,
+) -> dict[tuple[str, int], float]:
     hf_cfg, quant_cfg, vllm_config = _make_vllm_config(2, rms_norm_eps)
 
     with set_current_vllm_config(vllm_config), set_forward_context(None, vllm_config):
@@ -281,6 +322,9 @@ def _run_suite(
                 )
         finally:
             torch.set_default_dtype(prev_dtype)
+
+        assert moe.routed_output_transform is not None
+        assert moe.routed_output_transform.row_sharded is (not up_proj_sp)
 
         _init_weights(moe, 101, rank)
         routed = moe.experts.routed_experts
@@ -328,11 +372,13 @@ def _run_suite(
                 os.environ["VLLM_ROCM_FMOE_TP_SDMA_A_DTYPE"] = a_dtype
                 runner._init_fmoe_tp_sdma()
                 assert runner._fmoe_tp_sdma_enabled is True
+                assert runner._fmoe_tp_sdma_sp_enabled is up_proj_sp
                 assert runner._fmoe_tp_sdma_a_dtype == a_dtype
                 assert runner._fmoe_tp_sdma_epi_mode == expected_epi_mode
 
-                # Accuracy across decode fallback (T=16) and prefill (T=256, 2048, 4096)
-                for t in (16, 256, 2048, 4096):
+                # Accuracy across decode fallback (T=16), non-SP (T=256),
+                # aligned SP (T=512, 2048, 4096), and ragged SP (T=533).
+                for t in (16, 256, 512, 533, 2048, 4096):
                     x = _make_x(t)
                     with torch.no_grad():
                         runner._fmoe_tp_sdma_enabled = False
@@ -347,9 +393,14 @@ def _run_suite(
 
                     if t < runner._fmoe_tp_sdma_min_tokens:
                         assert not runner._use_fmoe_tp_sdma(t)
+                        assert not runner._use_fmoe_tp_sdma_sp(t)
                         assert _cos_sim(y_sdma, y_stock) > 0.99
                     else:
                         assert runner._use_fmoe_tp_sdma(t)
+                        if up_proj_sp and t >= runner._fmoe_tp_sdma_sp_min_tokens:
+                            assert runner._use_fmoe_tp_sdma_sp(t)
+                        else:
+                            assert not runner._use_fmoe_tp_sdma_sp(t)
                         cos_sdma = _cos_sim(y_sdma, y_ref)
                         sqnr_sdma = _sqnr_db(y_sdma, y_ref)
                         sqnr_stock = _sqnr_db(y_stock, y_ref)
@@ -391,7 +442,7 @@ def _run_suite(
             else:
                 os.environ["VLLM_ROCM_FMOE_TP_SDMA_A_DTYPE"] = prev_adt
 
-        # torch.compile safety across T=16, 256, 2048 for both fp4 and fp8
+        # torch.compile safety across T=16, 256, 1024, 4096 for both fp4 and fp8
         prev_adt = os.environ.get("VLLM_ROCM_FMOE_TP_SDMA_A_DTYPE")
         try:
             for a_dtype in ("fp4", "fp8"):
@@ -399,7 +450,7 @@ def _run_suite(
                 runner._init_fmoe_tp_sdma()
                 compiled_moe = torch.compile(moe, backend="inductor", dynamic=True)
                 with torch.no_grad():
-                    for t in (16, 256, 2048):
+                    for t in (16, 256, 1024, 4096):
                         x = _make_x(t)
                         y_comp = compiled_moe(x)
                         y_eager = moe(x)
@@ -421,6 +472,7 @@ def _run_suite(
 
         del moe, w13_raw, w13_s_raw, w2_raw, w2_s_raw
         torch.cuda.empty_cache()
+        return sqnr_by_dtype
 
 
 def _tp2_worker(rank: int, port: int) -> None:
@@ -434,6 +486,7 @@ def _tp2_worker(rank: int, port: int) -> None:
     os.environ["VLLM_ROCM_USE_AITER"] = "1"
     os.environ["VLLM_ROCM_USE_AITER_MOE"] = "1"
     os.environ["VLLM_ROCM_USE_AITER_FMOE_TP_SDMA"] = "1"
+    os.environ["VLLM_ROCM_KIMI_UP_PROJ_SP_MIN_TOKENS"] = "512"
 
     from vllm.config import set_current_vllm_config
     from vllm.distributed import (
@@ -453,11 +506,16 @@ def _tp2_worker(rank: int, port: int) -> None:
         )
         initialize_model_parallel(tensor_model_parallel_size=2)
 
-    for rms_norm_eps, expected_epi_mode in (
-        (1e-6, "rmsnorm_only"),
-        (1e-5, "raw_bf16"),
-    ):
-        _run_suite(rank, device, rms_norm_eps, expected_epi_mode)
+    sqnr_non_sp = _run_suite(rank, device, 1e-5, "raw_bf16", False)
+    sqnr_sp = _run_suite(rank, device, 1e-5, "raw_bf16", True)
+    for a_dt in ("fp4", "fp8"):
+        for t in (512, 533, 2048, 4096):
+            assert sqnr_sp[(a_dt, t)] > sqnr_non_sp[(a_dt, t)], (
+                f"Expected raw_bf16_sp SQNR ({sqnr_sp[(a_dt, t)]:.2f}) > "
+                f"non-SP raw_bf16 ({sqnr_non_sp[(a_dt, t)]:.2f}) for {a_dt} T={t}"
+            )
+    _run_suite(rank, device, 1e-6, "rmsnorm_only", False)
+    _run_suite(rank, device, 1e-6, "rmsnorm_only", True)
 
 
 def test_kimi_k3_latent_moe_fmoe_tp_sdma_tp2() -> None:

@@ -111,15 +111,23 @@ class ROCmLatentMoERunner(MoERunner):
         self._logged_sharded_tail = False
         self._quantized_routed_input: bool | None = None
         self._fmoe_tp_sdma_enabled: bool | None = None
+        self._fmoe_tp_sdma_sp_enabled: bool = False
         self._fmoe_tp_sdma_a_dtype: str = "fp8"
         self._fmoe_tp_sdma_epi_mode: str = "rmsnorm_only"
         self._fmoe_tp_sdma_ctx: Any | None = None
         self._fmoe_tp_sdma_min_tokens = max(
             1, int(os.getenv("VLLM_ROCM_FMOE_TP_SDMA_MIN_TOKENS", "256"))
         )
+        self._fmoe_tp_sdma_sp_min_tokens = int(
+            os.getenv(
+                "VLLM_ROCM_KIMI_UP_PROJ_SP_MIN_TOKENS",
+                str(max(self._fmoe_tp_sdma_min_tokens, 1024 * tp_size)),
+            )
+        )
 
     def _init_fmoe_tp_sdma(self) -> None:
         self._fmoe_tp_sdma_enabled = False
+        self._fmoe_tp_sdma_sp_enabled = False
         if not (
             envs.VLLM_ROCM_USE_AITER
             and envs.VLLM_ROCM_USE_AITER_MOE
@@ -233,13 +241,28 @@ class ROCmLatentMoERunner(MoERunner):
         self._fmoe_tp_sdma_a_dtype = a_dtype
         self._fmoe_tp_sdma_epi_mode = epi_mode
         self._fmoe_tp_sdma_enabled = True
+        self._fmoe_tp_sdma_sp_min_tokens = int(
+            os.getenv(
+                "VLLM_ROCM_KIMI_UP_PROJ_SP_MIN_TOKENS",
+                str(max(self._fmoe_tp_sdma_min_tokens, 1024 * p_cfg.tp_size)),
+            )
+        )
+        sp_key = (p_cfg.tp_size, 3584, 384, 16, 64, a_dtype, "situ", "raw_bf16_sp", 0)
+        self._fmoe_tp_sdma_sp_enabled = (
+            not self._up_proj_preshard
+            and os.getenv("VLLM_ROCM_KIMI_UP_PROJ_SP", "1").lower() in ("1", "true")
+            and sp_key in reg
+        )
         logger.info_once(
             "Kimi-K3 prefill using fmoe_tp_sdma "
-            "(a_dtype=%s, epi_mode=%s, min_tokens=%d, max_tokens=%d)",
+            "(a_dtype=%s, epi_mode=%s, min_tokens=%d, max_tokens=%d, "
+            "sp=%s, sp_min_tokens=%d)",
             a_dtype,
             epi_mode,
             self._fmoe_tp_sdma_min_tokens,
             max_tokens,
+            self._fmoe_tp_sdma_sp_enabled,
+            self._fmoe_tp_sdma_sp_min_tokens,
             scope="global",
         )
 
@@ -247,6 +270,13 @@ class ROCmLatentMoERunner(MoERunner):
         return (
             bool(self._fmoe_tp_sdma_enabled)
             and num_tokens >= self._fmoe_tp_sdma_min_tokens
+        )
+
+    def _use_fmoe_tp_sdma_sp(self, num_tokens: int) -> bool:
+        return (
+            self._fmoe_tp_sdma_sp_enabled
+            and self._use_fmoe_tp_sdma(num_tokens)
+            and num_tokens >= self._fmoe_tp_sdma_sp_min_tokens
         )
 
     def _run_fmoe_tp_sdma(
@@ -328,14 +358,81 @@ class ROCmLatentMoERunner(MoERunner):
             )
         return out
 
+    def _run_fmoe_tp_sdma_sp(
+        self,
+        x_in: torch.Tensor,
+        x_scale: torch.Tensor | None,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+        shared_output: torch.Tensor,
+    ) -> torch.Tensor:
+        from aiter.ops.asm.fmoe_tp_sdma import TpMoeCall, tp_moe_layer_asm
+
+        ctx = self._fmoe_tp_sdma_ctx
+        assert ctx is not None
+        transform = self.routed_output_transform
+        assert transform is not None
+
+        w1 = self.routed_experts.w13_weight.data.contiguous()
+        w2 = self.routed_experts.w2_weight.data.contiguous()
+        w1_scale = self.routed_experts.w13_weight_scale.data.contiguous()
+        w2_scale = self.routed_experts.w2_weight_scale.data.contiguous()
+        topk_ids_i32 = topk_ids.to(torch.int32).contiguous()
+        topk_weights_f32 = topk_weights.to(torch.float32).contiguous()
+        x_c = x_in.contiguous()
+        xs_c = x_scale.contiguous() if x_scale is not None else None
+        up_w_t = transform.up_proj.weight.t()
+
+        tokens = int(x_c.shape[0])
+        for start in range(0, tokens, ctx.max_tokens):
+            end = min(start + ctx.max_tokens, tokens)
+            call = TpMoeCall(
+                x=x_c[start:end],
+                topk_ids=topk_ids_i32[start:end],
+                topk_weights=topk_weights_f32[start:end],
+                w1=w1,
+                w2=w2,
+                w1_scale=w1_scale,
+                w2_scale=w2_scale,
+                norm_weight=None,
+                eps=1e-6,
+                x_scale=xs_c[start:end] if xs_c is not None else None,
+            )
+            res = tp_moe_layer_asm(
+                call,
+                ctx,
+                epi_mode="raw_bf16_sp",
+                a_dtype=self._fmoe_tp_sdma_a_dtype,
+                act="situ",
+            )
+            if res.valid_rows > 0:
+                latent_valid = res.out[: res.valid_rows]
+                if transform.norm is not None:
+                    latent_valid = transform.norm(latent_valid)
+                shared_output.narrow(0, start + res.row_start, res.valid_rows).addmm_(
+                    latent_valid, up_w_t
+                )
+        return torch.empty(
+            (tokens, self.moe_config.hidden_dim),
+            dtype=torch.bfloat16,
+            device=shared_output.device,
+        )
+
     def _shard_up_proj_tail(
         self,
         fused_output: torch.Tensor,
         shared_output: torch.Tensor,
         trunc_size: int | None,
-        fused_state: Literal["unreduced", "reduced", "normed"] = "unreduced",
+        fused_state: Literal[
+            "unreduced", "reduced", "normed", "folded_sp"
+        ] = "unreduced",
     ) -> torch.Tensor:
         """Tier 2: column-parallel up-projection folded into the final reduce."""
+        if fused_state == "folded_sp":
+            return self._maybe_reduce_final_output(
+                shared_output, trunc_size, output_is_reduced=False
+            )
+
         if not self._logged_sharded_tail:
             self._logged_sharded_tail = True
             logger.info_once(
@@ -420,7 +517,14 @@ class ROCmLatentMoERunner(MoERunner):
                     )
             else:
                 x_in, x_scale = hidden_states, None
-            latent_out = self._run_fmoe_tp_sdma(x_in, x_scale, topk_ids, topk_weights)
+            if self._use_fmoe_tp_sdma_sp(hidden_states.shape[0]):
+                latent_out = self._run_fmoe_tp_sdma_sp(
+                    x_in, x_scale, topk_ids, topk_weights, shared_output
+                )
+            else:
+                latent_out = self._run_fmoe_tp_sdma(
+                    x_in, x_scale, topk_ids, topk_weights
+                )
             return shared_output, latent_out
 
         return super()._forward_impl(
@@ -488,8 +592,12 @@ class ROCmLatentMoERunner(MoERunner):
         if og_hidden_dim_pre_xform is not None:
             fused_output = fused_output[..., :og_hidden_dim_pre_xform]
 
-        fused_state: Literal["unreduced", "reduced", "normed"] = "unreduced"
-        if use_fmoe_tp_sdma:
+        fused_state: Literal["unreduced", "reduced", "normed", "folded_sp"] = (
+            "unreduced"
+        )
+        if self._use_fmoe_tp_sdma_sp(hidden_states.shape[0]):
+            fused_state = "folded_sp"
+        elif use_fmoe_tp_sdma:
             fused_state = (
                 "normed" if self._fmoe_tp_sdma_epi_mode == "rmsnorm_only" else "reduced"
             )
