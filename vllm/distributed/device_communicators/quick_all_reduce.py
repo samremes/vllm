@@ -371,6 +371,8 @@ class QuickAllReduce:
             min_size = self._QR_MIN_SIZE[(dtype, self.world_size)][
                 self.qr_quant_level.value
             ]
+        if self._use_flydsl_int4(inp):
+            return inp_size >= min_size
         return inp_size <= self.qr_max_size and inp_size >= min_size
 
     def quick_all_reduce(self, inp: torch.Tensor, *, out: torch.Tensor = None):

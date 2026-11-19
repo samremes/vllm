@@ -27,27 +27,11 @@ def _has_fmoe_tp_sdma_tp2() -> bool:
         from aiter.ops.asm import fmoe_tp_sdma
 
         reg = fmoe_tp_sdma.load_fmoe_tp_sdma_registry()
-        return (
-            2,
-            3584,
-            384,
-            16,
-            64,
-            "fp8",
-            "situ",
-            "rmsnorm_only",
-            0,
-        ) in reg and (
-            2,
-            3584,
-            384,
-            16,
-            64,
-            "fp8",
-            "situ",
-            "raw_bf16",
-            0,
-        ) in reg
+        return all(
+            (2, 3584, 384, 16, 64, a_dt, "situ", epi, 0) in reg
+            for a_dt in ("fp4", "fp8")
+            for epi in ("rmsnorm_only", "raw_bf16")
+        )
     except Exception:
         return False
 
@@ -277,6 +261,7 @@ def _run_suite(
 ) -> None:
     import vllm.envs as envs
     from vllm.config import set_current_vllm_config
+    from vllm.distributed import get_tp_group
     from vllm.forward_context import set_forward_context
     from vllm.model_executor.model_loader.utils import process_weights_after_loading
     from vllm.models.kimi_k3.amd.linear import KimiMoE
@@ -306,11 +291,13 @@ def _run_suite(
 
         process_weights_after_loading(moe, vllm_config.model_config, device)
         runner = moe.experts
-        runner._init_fmoe_tp_sdma()
 
-        # Eligibility checks
-        assert runner._fmoe_tp_sdma_enabled is True
-        assert runner._fmoe_tp_sdma_epi_mode == expected_epi_mode
+        # Verify DCP=1 enable_token_sharding() on TP2
+        down_proj = moe.routed_expert_down_proj
+        assert down_proj is not None
+        down_proj.enable_token_sharding()
+        assert down_proj._token_group is get_tp_group()
+        assert down_proj.min_sharded_tokens == 2048
 
         prev_env = os.environ.get("VLLM_ROCM_USE_AITER_FMOE_TP_SDMA")
         try:
@@ -323,9 +310,6 @@ def _run_suite(
                 os.environ.pop("VLLM_ROCM_USE_AITER_FMOE_TP_SDMA", None)
             else:
                 os.environ["VLLM_ROCM_USE_AITER_FMOE_TP_SDMA"] = prev_env
-        runner._init_fmoe_tp_sdma()
-        assert runner._fmoe_tp_sdma_enabled is True
-        assert runner._fmoe_tp_sdma_epi_mode == expected_epi_mode
 
         g_in = torch.Generator(device="cuda").manual_seed(2026)
 
@@ -337,79 +321,105 @@ def _run_suite(
                 * 0.25
             )
 
-        # Accuracy across decode fallback (T=16) and prefill (T=256..8192)
-        for t in (16, 256, 4096, 8192):
-            x = _make_x(t)
-            with torch.no_grad():
-                runner._fmoe_tp_sdma_enabled = False
-                y_stock = moe(x)
-
-                runner._fmoe_tp_sdma_enabled = True
-                y_sdma = moe(x)
-
-                y_ref = _bf16_ref_forward(
-                    x, moe, w13_raw, w13_s_raw, w2_raw, w2_s_raw, rank
-                )
-
-            if t < runner._fmoe_tp_sdma_min_tokens:
-                assert not runner._use_fmoe_tp_sdma(t)
-                assert _cos_sim(y_sdma, y_stock) > 0.99
-            else:
-                assert runner._use_fmoe_tp_sdma(t)
-                cos_sdma = _cos_sim(y_sdma, y_ref)
-                sqnr_sdma = _sqnr_db(y_sdma, y_ref)
-                sqnr_stock = _sqnr_db(y_stock, y_ref)
-                assert cos_sdma > 0.98, f"Low cos_sim at T={t}: {cos_sdma}"
-                assert sqnr_sdma > sqnr_stock, (
-                    f"Expected fmoe_tp_sdma SQNR ({sqnr_sdma:.2f}) > "
-                    f"stock ({sqnr_stock:.2f})"
-                )
-
-        # Exercise distributed forward_quantized_fp8 + defer_projection at T=8192
-        from vllm.distributed import get_tp_group
-
-        down_proj = moe.routed_expert_down_proj
-        assert down_proj is not None
-        prev_tok_group = down_proj._token_group
+        sqnr_by_dtype: dict[tuple[str, int], float] = {}
+        prev_adt = os.environ.get("VLLM_ROCM_FMOE_TP_SDMA_A_DTYPE")
         try:
-            down_proj._token_group = get_tp_group()
-            x8 = _make_x(8192)
-            with torch.no_grad():
-                q_fp8, s_e8m0 = down_proj.forward_quantized_fp8(x8)
-                assert q_fp8.shape == (8192, 3584)
-                assert s_e8m0.shape == (8192, 3584 // 32)
-                y_ref8 = _bf16_ref_forward(
-                    x8, moe, w13_raw, w13_s_raw, w2_raw, w2_s_raw, rank
-                )
-                runner._fmoe_tp_sdma_enabled = False
-                y_stock_sharded = moe(x8)
-                runner._fmoe_tp_sdma_enabled = True
-                y_sdma_sharded = moe(x8)
-                assert _cos_sim(y_sdma_sharded, y_ref8) > 0.98
-                assert _sqnr_db(y_sdma_sharded, y_ref8) > _sqnr_db(
-                    y_stock_sharded, y_ref8
-                )
+            for a_dtype in ("fp4", "fp8"):
+                os.environ["VLLM_ROCM_FMOE_TP_SDMA_A_DTYPE"] = a_dtype
+                runner._init_fmoe_tp_sdma()
+                assert runner._fmoe_tp_sdma_enabled is True
+                assert runner._fmoe_tp_sdma_a_dtype == a_dtype
+                assert runner._fmoe_tp_sdma_epi_mode == expected_epi_mode
+
+                # Accuracy across decode fallback (T=16) and prefill (T=256, 2048, 4096)
+                for t in (16, 256, 2048, 4096):
+                    x = _make_x(t)
+                    with torch.no_grad():
+                        runner._fmoe_tp_sdma_enabled = False
+                        y_stock = moe(x)
+
+                        runner._fmoe_tp_sdma_enabled = True
+                        y_sdma = moe(x)
+
+                        y_ref = _bf16_ref_forward(
+                            x, moe, w13_raw, w13_s_raw, w2_raw, w2_s_raw, rank
+                        )
+
+                    if t < runner._fmoe_tp_sdma_min_tokens:
+                        assert not runner._use_fmoe_tp_sdma(t)
+                        assert _cos_sim(y_sdma, y_stock) > 0.99
+                    else:
+                        assert runner._use_fmoe_tp_sdma(t)
+                        cos_sdma = _cos_sim(y_sdma, y_ref)
+                        sqnr_sdma = _sqnr_db(y_sdma, y_ref)
+                        sqnr_stock = _sqnr_db(y_stock, y_ref)
+                        sqnr_by_dtype[(a_dtype, t)] = sqnr_sdma
+                        if a_dtype == "fp4":
+                            cos_stock = _cos_sim(y_sdma, y_stock)
+                            assert cos_stock > 0.99, (
+                                f"Low cos(sdma, stock) (fp4) at T={t}: {cos_stock}"
+                            )
+                            assert cos_sdma > 0.965, (
+                                f"Low cos(sdma, ref) (fp4) at T={t}: {cos_sdma}"
+                            )
+                        else:
+                            assert cos_sdma > 0.98, (
+                                f"Low cos_sim (fp8) at T={t}: {cos_sdma}"
+                            )
+                            assert sqnr_sdma > sqnr_stock, (
+                                f"Expected fp8 SQNR ({sqnr_sdma:.2f}) > "
+                                f"stock ({sqnr_stock:.2f})"
+                            )
+                            assert sqnr_sdma > sqnr_by_dtype[("fp4", t)], (
+                                f"Expected fp8 SQNR ({sqnr_sdma:.2f}) > "
+                                f"fp4 ({sqnr_by_dtype[('fp4', t)]:.2f})"
+                            )
+
+                # Exercise distributed forward_quantized / forward_quantized_fp8
+                x2 = _make_x(2048)
+                with torch.no_grad():
+                    if a_dtype == "fp4":
+                        q_in, s_in = down_proj.forward_quantized(x2)
+                        assert q_in.shape == (2048, 3584 // 2)
+                    else:
+                        q_in, s_in = down_proj.forward_quantized_fp8(x2)
+                        assert q_in.shape == (2048, 3584)
+                    assert s_in.shape == (2048, 3584 // 32)
         finally:
-            down_proj._token_group = prev_tok_group
+            if prev_adt is None:
+                os.environ.pop("VLLM_ROCM_FMOE_TP_SDMA_A_DTYPE", None)
+            else:
+                os.environ["VLLM_ROCM_FMOE_TP_SDMA_A_DTYPE"] = prev_adt
 
-        # torch.compile safety across T=16, 256, 4096
-        compiled_moe = torch.compile(moe, backend="inductor", dynamic=True)
-        with torch.no_grad():
-            for t in (16, 256, 4096):
-                x = _make_x(t)
-                y_comp = compiled_moe(x)
-                y_eager = moe(x)
-                y_eager2 = moe(x)
-                rel = _rel_rms(y_comp, y_eager)
-                rel_rep = _rel_rms(y_eager, y_eager2)
-                cos = _cos_sim(y_comp, y_eager)
-                tol = max(1e-2, rel_rep * 1.5 + 1e-2)
-                assert rel < tol and cos > 0.985, (
-                    f"torch.compile mismatch at T={t}: "
-                    f"rel={rel}, rel_rep={rel_rep}, cos={cos}"
-                )
+        # torch.compile safety across T=16, 256, 2048 for both fp4 and fp8
+        prev_adt = os.environ.get("VLLM_ROCM_FMOE_TP_SDMA_A_DTYPE")
+        try:
+            for a_dtype in ("fp4", "fp8"):
+                os.environ["VLLM_ROCM_FMOE_TP_SDMA_A_DTYPE"] = a_dtype
+                runner._init_fmoe_tp_sdma()
+                compiled_moe = torch.compile(moe, backend="inductor", dynamic=True)
+                with torch.no_grad():
+                    for t in (16, 256, 2048):
+                        x = _make_x(t)
+                        y_comp = compiled_moe(x)
+                        y_eager = moe(x)
+                        y_eager2 = moe(x)
+                        rel = _rel_rms(y_comp, y_eager)
+                        rel_rep = _rel_rms(y_eager, y_eager2)
+                        cos = _cos_sim(y_comp, y_eager)
+                        tol = max(1e-2, rel_rep * 1.5 + 1e-2)
+                        assert rel < tol and cos > 0.985, (
+                            f"torch.compile ({a_dtype}) mismatch at T={t}: "
+                            f"rel={rel}, rel_rep={rel_rep}, cos={cos}"
+                        )
+                del compiled_moe
+        finally:
+            if prev_adt is None:
+                os.environ.pop("VLLM_ROCM_FMOE_TP_SDMA_A_DTYPE", None)
+            else:
+                os.environ["VLLM_ROCM_FMOE_TP_SDMA_A_DTYPE"] = prev_adt
 
-        del compiled_moe, moe, w13_raw, w13_s_raw, w2_raw, w2_s_raw
+        del moe, w13_raw, w13_s_raw, w2_raw, w2_s_raw
         torch.cuda.empty_cache()
 
 

@@ -111,6 +111,7 @@ class ROCmLatentMoERunner(MoERunner):
         self._logged_sharded_tail = False
         self._quantized_routed_input: bool | None = None
         self._fmoe_tp_sdma_enabled: bool | None = None
+        self._fmoe_tp_sdma_a_dtype: str = "fp8"
         self._fmoe_tp_sdma_epi_mode: str = "rmsnorm_only"
         self._fmoe_tp_sdma_ctx: Any | None = None
         self._fmoe_tp_sdma_min_tokens = max(
@@ -197,7 +198,21 @@ class ROCmLatentMoERunner(MoERunner):
                 scope="global",
             )
             return
-        key = (p_cfg.tp_size, 3584, 384, 16, 64, "fp8", "situ", epi_mode, 0)
+        a_dtype_env = os.getenv("VLLM_ROCM_FMOE_TP_SDMA_A_DTYPE", "auto").lower()
+        if a_dtype_env == "auto":
+            a_dtype = (
+                "fp4"
+                if rocm_aiter_ops.get_fused_moe_situv2_activation() == "a4w4"
+                else "fp8"
+            )
+        elif a_dtype_env in ("fp4", "fp8"):
+            a_dtype = a_dtype_env
+        else:
+            raise ValueError(
+                "Invalid VLLM_ROCM_FMOE_TP_SDMA_A_DTYPE="
+                f"{a_dtype_env!r}; expected 'auto', 'fp4', or 'fp8'."
+            )
+        key = (p_cfg.tp_size, 3584, 384, 16, 64, a_dtype, "situ", epi_mode, 0)
         if key not in reg:
             return
         max_batched = 8192
@@ -215,11 +230,13 @@ class ROCmLatentMoERunner(MoERunner):
             896,
             384,
         )
+        self._fmoe_tp_sdma_a_dtype = a_dtype
         self._fmoe_tp_sdma_epi_mode = epi_mode
         self._fmoe_tp_sdma_enabled = True
         logger.info_once(
             "Kimi-K3 prefill using fmoe_tp_sdma "
-            "(epi_mode=%s, min_tokens=%d, max_tokens=%d)",
+            "(a_dtype=%s, epi_mode=%s, min_tokens=%d, max_tokens=%d)",
+            a_dtype,
             epi_mode,
             self._fmoe_tp_sdma_min_tokens,
             max_tokens,
@@ -280,7 +297,7 @@ class ROCmLatentMoERunner(MoERunner):
                 call,
                 ctx,
                 epi_mode=epi_mode,
-                a_dtype="fp8",
+                a_dtype=self._fmoe_tp_sdma_a_dtype,
                 act="situ",
             ).out
 
@@ -306,7 +323,7 @@ class ROCmLatentMoERunner(MoERunner):
                 ctx,
                 epi_mode=epi_mode,
                 out=out[start:end],
-                a_dtype="fp8",
+                a_dtype=self._fmoe_tp_sdma_a_dtype,
                 act="situ",
             )
         return out
@@ -393,9 +410,14 @@ class ROCmLatentMoERunner(MoERunner):
             )
             if hidden_states.shape[-1] != self.moe_config.hidden_dim:
                 assert self.routed_input_transform is not None
-                x_in, x_scale = self.routed_input_transform.forward_quantized_fp8(
-                    hidden_states
-                )
+                if self._fmoe_tp_sdma_a_dtype == "fp4":
+                    x_in, x_scale = self.routed_input_transform.forward_quantized(
+                        hidden_states
+                    )
+                else:
+                    x_in, x_scale = self.routed_input_transform.forward_quantized_fp8(
+                        hidden_states
+                    )
             else:
                 x_in, x_scale = hidden_states, None
             latent_out = self._run_fmoe_tp_sdma(x_in, x_scale, topk_ids, topk_weights)
