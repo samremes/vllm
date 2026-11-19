@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from collections.abc import Iterable
 from typing import Any, cast
 
@@ -174,15 +175,20 @@ class KimiRoutedInputLinear(ReplicatedLinear):
             not on_gfx950()
             or config.lora_config is not None
             or parallel.use_ubatching
-            or parallel.tensor_parallel_size != 8
-            or parallel.decode_context_parallel_size != 8
+            or parallel.tensor_parallel_size not in (2, 4, 8)
             or self.input_size != 7168
             or self.output_size != 3584
         ):
             return
-        tp, dcp = get_tp_group(), get_dcp_group()
-        if tp.ranks == dcp.ranks and tp.rank_in_group == dcp.rank_in_group:
-            self._token_group = dcp
+        tp = get_tp_group()
+        if parallel.decode_context_parallel_size == 1:
+            self._token_group = tp
+        else:
+            dcp = get_dcp_group()
+            if tp.ranks == dcp.ranks and tp.rank_in_group == dcp.rank_in_group:
+                self._token_group = dcp
+        if self._token_group is not None:
+            self.min_sharded_tokens = 1024 * self._token_group.world_size
 
     def forward(self, x: torch.Tensor):
         group = self._token_group
@@ -226,6 +232,35 @@ class KimiRoutedInputLinear(ReplicatedLinear):
         gathered = gathered.view(torch.uint8)[: x.shape[0]]
         split = self.output_size // 2
         values = gathered[:, :split].contiguous().view(dtypes.fp4x2)
+        scales = gathered[:, split:].contiguous().view(dtypes.fp8_e8m0)
+        return values, scales
+
+    def forward_quantized_fp8(self, x: torch.Tensor):
+        """Exchange MXFP8 activations and plain e8m0 scales for fmoe_tp_sdma."""
+        from aiter import dtypes
+        from aiter.ops.quant import per_1x32_mx_quant_hip
+
+        group = self._token_group
+        assert group is not None
+        projected, bias = self._project_local(x)
+        assert bias is None
+        values, scales = per_1x32_mx_quant_hip(
+            projected,
+            quant_dtype=dtypes.fp8,
+            scale_type=dtypes.fp8_e8m0,
+            shuffle=False,
+        )
+        packed = torch.cat(
+            (
+                values.view(torch.uint8),
+                scales.view(torch.uint8).view(projected.shape[0], -1),
+            ),
+            dim=1,
+        )
+        gathered = group.all_gather(packed.view(torch.int32), dim=0)
+        gathered = gathered.view(torch.uint8)[: x.shape[0]]
+        split = self.output_size
+        values = gathered[:, :split].contiguous().view(dtypes.fp8)
         scales = gathered[:, split:].contiguous().view(dtypes.fp8_e8m0)
         return values, scales
 
@@ -389,11 +424,21 @@ class KimiMoE(nn.Module):
                 if self.latent_moe_use_norm
                 else None
             )
+            from vllm.platforms.rocm import on_gfx950
+
+            use_replicated_up_proj_sp = (
+                on_gfx950()
+                and envs.VLLM_ROCM_USE_AITER
+                and envs.VLLM_ROCM_USE_AITER_MOE
+                and envs.VLLM_ROCM_USE_AITER_FMOE_TP_SDMA
+                and os.getenv("VLLM_ROCM_KIMI_UP_PROJ_SP", "1").lower() in ("1", "true")
+            )
             shard_up_proj = (
                 self.tp_size > 1
                 and hidden_size % self.tp_size == 0
                 and self.num_shared_experts is not None
                 and self.routed_scaling_factor == 1.0
+                and not use_replicated_up_proj_sp
             )
             if shard_up_proj:
                 # gather_output is a fallback restoring the full hidden dim for

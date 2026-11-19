@@ -146,6 +146,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_AITER_LINEAR: bool = True
     VLLM_ROCM_USE_AITER_LINEAR_HIPBMM: bool = False
     VLLM_ROCM_USE_AITER_MOE: bool = True
+    VLLM_ROCM_USE_AITER_FMOE_TP_SDMA: bool = True
     VLLM_FP8_MOE_REQUANT: Literal["none", "mxfp4"] = "none"
     VLLM_FP8_MOE_REQUANT_ACT: Literal["a8w4", "a4w4", "a16w4"] = "a8w4"
     VLLM_ROCM_AITER_MOE_DISPATCH_POLICY: int = 0
@@ -1390,6 +1391,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_ROCM_USE_AITER_MOE": lambda: (
         os.getenv("VLLM_ROCM_USE_AITER_MOE", "True").lower() in ("true", "1")
+    ),
+    "VLLM_ROCM_USE_AITER_FMOE_TP_SDMA": lambda: (
+        os.getenv("VLLM_ROCM_USE_AITER_FMOE_TP_SDMA", "True").lower() in ("true", "1")
     ),
     # Activation dtype for the Kimi-K3 SiTU MXFP4 MoE (AITER FlyDSL SiTUv2):
     # auto (= a4w4), a4w4, a8w4 or a16w4. Legacy 1/0 mean a4w4/a16w4.
