@@ -229,6 +229,35 @@ class KimiRoutedInputLinear(ReplicatedLinear):
         scales = gathered[:, split:].contiguous().view(dtypes.fp8_e8m0)
         return values, scales
 
+    def forward_quantized_fp8(self, x: torch.Tensor):
+        """Exchange MXFP8 activations and plain e8m0 scales for fmoe_tp_sdma."""
+        from aiter import dtypes
+        from aiter.ops.quant import per_1x32_mx_quant_hip
+
+        group = self._token_group
+        assert group is not None
+        projected, bias = self._project_local(x)
+        assert bias is None
+        values, scales = per_1x32_mx_quant_hip(
+            projected,
+            quant_dtype=dtypes.fp8,
+            scale_type=dtypes.fp8_e8m0,
+            shuffle=False,
+        )
+        packed = torch.cat(
+            (
+                values.view(torch.uint8),
+                scales.view(torch.uint8).view(projected.shape[0], -1),
+            ),
+            dim=1,
+        )
+        gathered = group.all_gather(packed.view(torch.int32), dim=0)
+        gathered = gathered.view(torch.uint8)[: x.shape[0]]
+        split = self.output_size
+        values = gathered[:, :split].contiguous().view(dtypes.fp8)
+        scales = gathered[:, split:].contiguous().view(dtypes.fp8_e8m0)
+        return values, scales
+
 
 class KimiRoutedOutputTransform(nn.Module):
     def __init__(
